@@ -1,0 +1,80 @@
+#!/bin/bash
+
+ALLOW_FILE=.volume.conf	# namespace/pvc
+MOUNTPOINT=.volume
+FIFO=/var/run/user-mount
+
+declare -A PVC_USER	# [namespace/pvc] -> list of usernames
+declare -A USER_PVC     # [username] -> list of namespace/pvc
+
+homedir() {
+  getent passwd "$1" | cut -f6 -d:
+}
+home-to-user() {
+  getent | awk -F: '$6=="'"$1"'" {print $1}'
+}
+
+mkfifo -m 600 "$FIFO"
+
+ensure_mounted() {	# $u, $v
+  H=$(homedir $u)
+  grep -q "^[^ ]* $H/$MOUNTPOINT/$v " /proc/mounts && continue	# already mounted
+  ns=${v%/*}
+  pvc=${v#*/}
+  pv=$(kubectl -n $ns get pvc/$pvc -o jsonpath='{.spec.volumeName}')
+  [ -z "$pv" ] && continue
+  pvpath="$(kubectl get pv/$pv -o jsonpath='{.spec.hostPath.path}')"
+  [ -z "$pvpath" ] && return
+  [ -d "$pvpath" ] || return
+  su "$u" mkdir -p "$H/$MOUNTPOINT/$v" || return
+  mount -o bind,nodev,nosuid "$pvpath" "$H/$MOUNTPOINT/$v"
+}
+
+
+while read objtype ref x
+do
+  case "$objtype" in
+  U*|u*) u="$ref"
+         H="$(homedir "$ref")"
+         [ -z "$H" ] && continue
+         [ -d "$H" ] || continue
+         if [ -r "$H/$ALLOW_FILE" ]
+         then
+           USER_PVC[$u]=$(cut -f1 -d'#' "$H/$ALLOW_FILE" | awk '{print $1}' | tr -s '\t\n' '  ')
+         else 
+           USER_PVC[$u]=''
+         fi
+         for v in USER_PVC[$u]
+         do
+           [ "${PVC_USER[$v]/$u/}" = "${PVC_USER[$v]}" ] && continue	# PVC does not allow this user
+           ensure_mounted
+         done
+         awk '$2 ~ "^'"$H/$MOUNTPOINT/"'" {print gensub("^'"$H/$MOUNTPOINT/"'", "", "g", $2);}' \
+         | while read v x
+         do
+           [ "${PVC_USER[$v]/$u/}" != "${PVC_USER[$v]}" ] \
+           && [ "${USER_PVC[$u]/$v/}" != "${USER_PVC[$u]}" ] \
+           && continue
+           umount -f $H/$MOUNTPOINT/$v
+         done
+  ;;
+  P*|p*) v=$ref
+         ns="${v%/*}"; pvc="${v#*/}"
+         PVC_USER[$v]=$(kubectl -n $ns get pvc/$pvc -o jsonpath='{.metadata.annotations.user-mount}')
+         for u in PVC_USER[$v]
+         do
+           [ "${USER_PVC[$u]/$v/}" = "${USER_PVC[$u]}" ] && continue	# User does not want to mount the volume
+           ensure_mounted
+         done
+         awk '$2 ~ "'"/$v"'$" {print gensub("'"/$MOUNTPOINT/$v"'$", "", "g", $2);}' \
+         | while read hh x
+         do
+           u="$(home-to-user $hh)"
+           [ "${PVC_USER[$v]/$u/}" != "${PVC_USER[$v]}" ] \
+           && [ "${USER_PVC[$u]/$v/}" != "${USER_PVC[$u]}" ] \
+           && continue
+           umount -f $hh/$MOUNTPOINT/$v
+         done
+  ;;
+  esac
+done < "$FIFO"
