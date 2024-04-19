@@ -10,6 +10,9 @@ declare -A USER_WATCH   # [username] -> pid of watch process
 
 
 [ ! -x /usr/bin/inotifywait ] && echo "please install package inotify-tools!" >&2 && exit 1
+echo "Waiting for api-server..." >&2
+while ! kubectl get nodes -o name ; do sleep 60 ; done &> /dev/null
+echo "OK, api-server reachable." >&2
 
 rm -f "$FIFO"
 
@@ -116,15 +119,22 @@ restarter() {
   done
 }
 
+restart-all() {
+  trap - CHLD
+  kill ${USER_WATCH[*]} $PVC_WATCH_PID
+  exec $0
+  exit
+}
 
 trap 'kill $PVC_WATCH_PID ${USER_WATCH[*]}' exit
 trap restarter CHLD
+trap restart-all HUP
 
 start-pvc-watch
 
 while true
 do
-  while read objtype ref x
+  while read -t 10 objtype ref x
   do
     case "$objtype" in
     U*|u*) user="$ref"
