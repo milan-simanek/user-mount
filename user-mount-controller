@@ -4,6 +4,8 @@ ALLOW_FILE=.volume.conf	# namespace/pvc
 MOUNTPOINT=.volume
 FIFO=/var/run/user-mount
 
+rm -f "$FIFO"
+
 user-watch() {	# $1=username
   [ -z "$1" ] && return
   H=$(homedir $1)
@@ -27,6 +29,8 @@ start-pvc-watch() {
 declare -A PVC_USER	# [namespace/pvc] -> list of usernames
 declare -A USER_PVC     # [username] -> list of namespace/pvc
 declare -A USER_WATCH   # [username] -> pid of watch process
+
+trap 'kill $PVC_WATCH_PID ${USER_WATCH[*]}' exit
 
 start-user-watch() {	# $1=username
   [ -n "$1" ] || return
@@ -66,10 +70,12 @@ ensure_mounted() {	# $u, $v
 
 start-pvc-watch
 
-while read objtype ref x
+while true
 do
-  case "$objtype" in
-  U*|u*) u="$ref"
+  while read objtype ref x
+  do
+    case "$objtype" in
+    U*|u*) u="$ref"
          H="$(homedir "$ref")"
          match=0;for uu in "${PVC_USER[@]}"; do [ "$uu" = "$u" ] && match=1 && break; done
          if [ "$match" = 0 ]
@@ -77,7 +83,7 @@ do
            stop-user-watch $u
            PVC_USER[$v]=''
            continue
-         }
+         fi
          [ -z "$H" ] && continue
          [ -d "$H" ] || continue
          if [ -r "$H/$ALLOW_FILE" ]
@@ -86,7 +92,7 @@ do
          else 
            USER_PVC[$u]=''
          fi
-         for v in USER_PVC[$u]
+         for v in ${USER_PVC[$u]}
          do
            [ "${PVC_USER[$v]/$u/}" = "${PVC_USER[$v]}" ] && continue	# PVC does not allow this user
            ensure_mounted
@@ -99,17 +105,17 @@ do
            && continue
            umount -f $H/$MOUNTPOINT/$v
          done
-  ;;
-  P*|p*) v=$ref
+    ;;
+    P*|p*) v=$ref
          ns="${v%/*}"; pvc="${v#*/}"
          PVC_USER[$v]=$(kubectl -n $ns get pvc/$pvc -o jsonpath='{.metadata.annotations.user-mount}')
-         for u in PVC_USER[$v]
+         for u in ${PVC_USER[$v]}
          do
            start-user-watch $u
            [ "${USER_PVC[$u]/$v/}" = "${USER_PVC[$u]}" ] && continue	# User does not want to mount the volume
            ensure_mounted
          done
-         awk '$2 ~ "'"/$v"'$" {print gensub("'"/$MOUNTPOINT/$v"'$", "", "g", $2);}' \
+         awk '$2 ~ "'"/$v"'$" {print gensub("'"/$MOUNTPOINT/$v"'$", "", "g", $2);}' /proc/mounts \
          | while read hh x
          do
            u="$(home-to-user $hh)"
@@ -118,6 +124,7 @@ do
            && continue
            umount -f $hh/$MOUNTPOINT/$v
          done
-  ;;
-  esac
-done < "$FIFO"
+    ;;
+    esac
+  done < "$FIFO"
+done
