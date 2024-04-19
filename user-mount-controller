@@ -1,19 +1,26 @@
 #!/bin/bash
 
-ALLOW_FILE=.volume.conf	# namespace/pvc
+ALLOW_FILE=.volume.conf		# format: each line contains namespace/pvc
 MOUNTPOINT=.volume
 FIFO=/var/run/user-mount
+
+declare -A PVC_USER	# [namespace/pvc] -> list of usernames
+declare -A USER_PVC     # [username] -> list of namespace/pvc
+declare -A USER_WATCH   # [username] -> pid of watch process
+
+
+[ ! -x /usr/bin/inotifywait ] && echo "please install package inotify-tools!" >&2 && exit 1
 
 rm -f "$FIFO"
 
 user-watch() {	# $1=username
   [ -z "$1" ] && return
-  H=$(homedir $1)
-  [ -z "$H" -o ! -d "$H" ] && return
-  echo U $u > "$FIFO"	# maybe we missed something, so just to be sure
-  inotify -mq -e create,close_write,move,delete "$H" | while read fname events arg
+  uhome=$(homedir $1)
+  [ -z "$uhome" -o ! -d "$uhome" ] && return
+  echo U $user > "$FIFO"	# maybe we missed something, so just to be sure
+  inotifywait -mq -e create,close_write,move,delete "$uhome" | while read fname events arg
   do
-    [ "$arg" = "$ALLOW_FILE" ] && echo U $u > "$FIFO"
+    [ "$arg" = "$ALLOW_FILE" ] && echo U $user > "$FIFO"
   done
 }
 
@@ -24,49 +31,94 @@ start-pvc-watch() {
       echo P "$pvc" > "$FIFO"
     done &
   PVC_WATCH_PID=$!
+  echo "PVC watch started as $PVC_WATCH_PID" >&2
 }
 
-declare -A PVC_USER	# [namespace/pvc] -> list of usernames
-declare -A USER_PVC     # [username] -> list of namespace/pvc
-declare -A USER_WATCH   # [username] -> pid of watch process
-
-trap 'kill $PVC_WATCH_PID ${USER_WATCH[*]}' exit
 
 start-user-watch() {	# $1=username
+  echo "Starting user-watch $1" >&2
   [ -n "$1" ] || return
   [ -n "${USER_WATCH[$1]}" -a -d /proc/"${USER_WATCH[$1]}" ] && return # already running
   user-watch "$1" &
   USER_WATCH[$1]=$!
+  echo "User watch [$1] started as ${USER_WATCH[$1]}" >&2
 }
 stop-user-watch() {	# $1=username
+  echo "Stopping user-watch $1" >&2
   [ -n "$1" ] || return
   [ -z "${USER_WATCH[$1]}" ] && return		# no watch
-  [ -d /proc/"${USER_WATCH[$1]}" ] && kill "${USER_WATCH[$1]}"
   USER_WATCH[$1]=''
+  [ -d /proc/"${USER_WATCH[$1]}" ] && kill "${USER_WATCH[$1]}"
 }
 
-homedir() {
+homedir() {		# $1=user
   getent passwd "$1" | cut -f6 -d:
 }
-home-to-user() {
-  getent | awk -F: '$6=="'"$1"'" {print $1}'
+home-to-user() {	# $1=home_directory
+  getent passwd | awk -F: '$6=="'"$1"'" {print $1}'
 }
 
 mkfifo -m 600 "$FIFO"
 
-ensure_mounted() {	# $u, $v
-  H=$(homedir $u)
-  grep -q "^[^ ]* $H/$MOUNTPOINT/$v " /proc/mounts && continue	# already mounted
-  ns=${v%/*}
-  pvc=${v#*/}
-  pv=$(kubectl -n $ns get pvc/$pvc -o jsonpath='{.spec.volumeName}')
-  [ -z "$pv" ] && continue
-  pvpath="$(kubectl get pv/$pv -o jsonpath='{.spec.hostPath.path}')"
-  [ -z "$pvpath" ] && return
-  [ -d "$pvpath" ] || return
-  su "$u" mkdir -p "$H/$MOUNTPOINT/$v" || return
-  mount -o bind,nodev,nosuid "$pvpath" "$H/$MOUNTPOINT/$v"
+does_user_ref_vol() { # $1=user $2=volume
+  local vlist=" ${USER_PVC[$1]} "
+  [ "${vlist/ $2 }" != "$vlist" ]
 }
+does_vol_ref_user() { # $1=user $2=volume
+  local ulist=" ${PVC_USER[$2]} "
+  [ "${ulist/ $1 }" != "$ulist" ]
+}
+check_references() {  # $1=user $2=volume
+  does_user_ref_vol "$1" "$2" && does_vol_ref_user "$1" "$2"
+}
+
+ensure_mounted() {	# $1=user, $2=vol
+  local uhome=$(homedir $1)
+  grep -q "^[^ ]* $uhome/$MOUNTPOINT/$2 " /proc/mounts && return	# already mounted
+  local ns=${2%/*}
+  local pvc=${2#*/}
+  local mnt=$uhome/$MOUNTPOINT/$ns/$pvc
+  local pv=$(kubectl -n $ns get pvc/$pvc -o jsonpath='{.spec.volumeName}')
+  [ -z "$pv" ] && return	# PVC likely still not bound to PV
+  pvpath="$(kubectl get pv/$pv -o jsonpath='{.spec.hostPath.path}')"
+  [ -z "$pvpath" ] && return	# PV is likely not of hostPath type
+  [ -d "$pvpath" ] || return	# PV is not a directory?!
+  su "$1" -c "mkdir -p $mnt" || return
+  echo "Mounting PVC $2 into $mnt" >&2
+  mount -o bind,nodev,nosuid "$pvpath" "$mnt"
+}
+
+check_umount() {		# $1=user_home $2=volume
+  local uhome_re="${1:-.*}"
+  local vol_re="${2:-.*}"
+  local xuhome xvol xuser
+  awk '$2 ~ "^'"$uhome_re/$MOUNTPOINT/$vol_re"'$" {print gensub("^('"$uhome_re)/$MOUNTPOINT/($vol_re)"'$", "\\1 \\2", 1, $2);}' /proc/mounts \
+  | while read xuhome xvol
+  do
+    xuser="$(home-to-user "$xuhome")"
+    check_references "$xuser" "$xvol" && continue
+    echo "Unmounting $xvol for user $xuser"
+    umount -f $xuhome/$MOUNTPOINT/$xvol
+    rmdir $xuhome/$MOUNTPOINT/$xvol
+    rmdir --ignore-fail-on-non-empty $xuhome/$MOUNTPOINT/${xvol%/*} $xuhome/$MOUNTPOINT 
+  done
+}
+
+restarter() {
+  wait -n -p pid 
+  status=$?
+  [ "$status" = 127 ] && return
+  echo "skoncil proces $pid status=$?" >&2
+  [ "$pid" = "$PVC_WATCH_PID" ] && echo "restarting PVC watch" >&2 && start-pvc-watch && return
+  for user in "${!USER_WATCH[@]}"
+  do
+    [ "$pid" = "${USER_WATCH[$user]}" ] && start-user-watch "$user"
+  done
+}
+
+
+trap 'kill $PVC_WATCH_PID ${USER_WATCH[*]}' exit
+trap restarter CHLD
 
 start-pvc-watch
 
@@ -75,55 +127,38 @@ do
   while read objtype ref x
   do
     case "$objtype" in
-    U*|u*) u="$ref"
-         H="$(homedir "$ref")"
-         match=0;for uu in "${PVC_USER[@]}"; do [ "$uu" = "$u" ] && match=1 && break; done
-         if [ "$match" = 0 ]
-         then 
-           stop-user-watch $u
-           PVC_USER[$v]=''
-           continue
-         fi
-         [ -z "$H" ] && continue
-         [ -d "$H" ] || continue
-         if [ -r "$H/$ALLOW_FILE" ]
-         then
-           USER_PVC[$u]=$(cut -f1 -d'#' "$H/$ALLOW_FILE" | awk '{print $1}' | tr -s '\t\n' '  ')
-         else 
-           USER_PVC[$u]=''
-         fi
-         for v in ${USER_PVC[$u]}
-         do
-           [ "${PVC_USER[$v]/$u/}" = "${PVC_USER[$v]}" ] && continue	# PVC does not allow this user
-           ensure_mounted
-         done
-         awk '$2 ~ "^'"$H/$MOUNTPOINT/"'" {print gensub("^'"$H/$MOUNTPOINT/"'", "", "g", $2);}' \
-         | while read v x
-         do
-           [ "${PVC_USER[$v]/$u/}" != "${PVC_USER[$v]}" ] \
-           && [ "${USER_PVC[$u]/$v/}" != "${USER_PVC[$u]}" ] \
-           && continue
-           umount -f $H/$MOUNTPOINT/$v
-         done
+    U*|u*) user="$ref"
+           uhome="$(homedir "$ref")"
+           USER_PVC[$user]=''
+           # does any volume refer to the user $user ?
+           match=0;for uu in ${PVC_USER[*]}; do [ "$uu" = "$user" ] && match=1 && break; done
+           if [ "$match" = 0 ]
+           then 
+             stop-user-watch $user
+             continue # no volume reffered to the user => no need to umount
+           fi
+           [ -z "$uhome" ] && echo "Error: User '$user' has no home directory?" >&2 && continue	
+           [ ! -d "$uhome" ] && echo "Error: User '$user': home directory '$uhome' is not a directory?" >&2 && continue
+           [ -r "$uhome/$ALLOW_FILE" ] \
+           && USER_PVC[$user]=$( cut -f1 -d'#' "$uhome/$ALLOW_FILE" \
+                               | tr -dc 'a-z./ \t\n-' \
+                               | awk '{print $1}' \
+                               | tr -s ' \t\n' ' ' )
+           for vol in ${USER_PVC[$user]}
+           do
+             does_vol_ref_user $user $vol && ensure_mounted $user $vol
+           done
+           check_umount $uhome ""
     ;;
-    P*|p*) v=$ref
-         ns="${v%/*}"; pvc="${v#*/}"
-         PVC_USER[$v]=$(kubectl -n $ns get pvc/$pvc -o jsonpath='{.metadata.annotations.user-mount}')
-         for u in ${PVC_USER[$v]}
-         do
-           start-user-watch $u
-           [ "${USER_PVC[$u]/$v/}" = "${USER_PVC[$u]}" ] && continue	# User does not want to mount the volume
-           ensure_mounted
-         done
-         awk '$2 ~ "'"/$v"'$" {print gensub("'"/$MOUNTPOINT/$v"'$", "", "g", $2);}' /proc/mounts \
-         | while read hh x
-         do
-           u="$(home-to-user $hh)"
-           [ "${PVC_USER[$v]/$u/}" != "${PVC_USER[$v]}" ] \
-           && [ "${USER_PVC[$u]/$v/}" != "${USER_PVC[$u]}" ] \
-           && continue
-           umount -f $hh/$MOUNTPOINT/$v
-         done
+    P*|p*) vol=$ref
+           ns="${vol%/*}"; pvc="${vol#*/}"
+           PVC_USER[$vol]=$(kubectl -n $ns get pvc/$pvc -o jsonpath='{.metadata.annotations.user-mount}')
+           for user in ${PVC_USER[$vol]}
+           do
+             start-user-watch $user
+             does_user_ref_vol $user $vol && ensure_mounted $user $vol
+           done
+           check_umount "" $vol
     ;;
     esac
   done < "$FIFO"
