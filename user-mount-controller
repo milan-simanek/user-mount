@@ -1,8 +1,10 @@
 #!/bin/bash
 
-ALLOW_FILE=.volume.conf		# format: each line contains namespace/pvc
-MOUNTPOINT=.volume
-FIFO=/var/run/user-mount
+# default values:
+[ -z "$CONFIG_FILE" ]	&& CONFIG_FILE=.volume.conf	# format: each line contains namespace/pvc
+[ -z "$RMOUNTPOINT" ]	&& MOUNTPOINT=.volume
+[ -z "$FIFO" ]		&& FIFO=/var/run/user-mount
+[ -z "$KUBECONFIG" ]	&& KUBECONFIG=/opt/user-mount/etc/kubeconfig.yaml
 
 declare -A PVC_USER	# [namespace/pvc] -> list of usernames
 declare -A USER_PVC     # [username] -> list of namespace/pvc
@@ -10,12 +12,13 @@ declare -A USER_WATCH   # [username] -> pid of watch process
 
 # initial check
 [ ! -x /usr/bin/inotifywait ] && echo "please install package inotify-tools!" >&2 && exit 1
+[ ! -r "$KUBECONFIG" -o ! -f "$KUBECONFIG" ] && "kube config not found or not readable: $KUBECONFIG" >&2 && exit 1
 echo "Waiting for api-server..." >&2
-while ! kubectl get nodes -o name ; do sleep 60 ; done &> /dev/null
+while ! kubectl --kubeconfig "$KUBECONFIG" get nodes -o name ; do sleep 60 ; done &> /dev/null
 echo "OK, api-server reachable." >&2
 
 start-pvc-watch() {
-  kubectl get pvc -A -w -o jsonpath='{"P "}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}' </dev/null > "$FIFO" &
+  kubectl --kubeconfig "$KUBECONFIG" get pvc -A -w -o jsonpath='{"P "}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}' </dev/null > "$FIFO" &
   PVC_WATCH_PID=$!
   echo "PVC watch started as $PVC_WATCH_PID" >&2
 }
@@ -67,9 +70,9 @@ ensure_mounted() {	# $1=user, $2=vol
   local ns=${2%/*}
   local pvc=${2#*/}
   local mnt=$uhome/$MOUNTPOINT/$ns/$pvc
-  local pv=$(kubectl -n $ns get pvc/$pvc -o jsonpath='{.spec.volumeName}')
+  local pv=$(kubectl --kubeconfig "$KUBECONFIG" -n $ns get pvc/$pvc -o jsonpath='{.spec.volumeName}')
   [ -z "$pv" ] && return	# PVC likely still not bound to PV
-  pvpath="$(kubectl get pv/$pv -o jsonpath='{.spec.hostPath.path}')"
+  pvpath="$(kubectl --kubeconfig "$KUBECONFIG" get pv/$pv -o jsonpath='{.spec.hostPath.path}')"
   [ -z "$pvpath" ] && return	# PV is likely not of hostPath type
   [ -d "$pvpath" ] || return	# PV is not a directory?!
   su "$1" -c "mkdir -p $mnt" || return
@@ -123,7 +126,7 @@ do
   read -t 10 objtype ref file x || continue
   case "$objtype" in
   U*|u*)   user="$ref"
-           [ -n "$file" -a "$file" != "$ALLOW_FILE" ] && continue
+           [ -n "$file" -a "$file" != "$CONFIG_FILE" ] && continue
            uhome="$(homedir "$user")"
            USER_PVC[$user]=''
            # does any volume refer to the user $user ?
@@ -135,8 +138,8 @@ do
            fi
            [ -z "$uhome" ] && echo "Error: User '$user' has no home directory?" >&2 && continue	
            [ ! -d "$uhome" ] && echo "Error: User '$user': home directory '$uhome' is not a directory?" >&2 && continue
-           [ -r "$uhome/$ALLOW_FILE" -a -f "$uhome/$ALLOW_FILE" ] \
-           && USER_PVC[$user]=$( cut -f1 -d'#' "$uhome/$ALLOW_FILE" \
+           [ -r "$uhome/$CONFIG_FILE" -a -f "$uhome/$CONFIG_FILE" ] \
+           && USER_PVC[$user]=$( cut -f1 -d'#' "$uhome/$CONFIG_FILE" \
                                | tr -dc 'a-z./ \t\n-' \
                                | awk '{print $1}' \
                                | tr -s ' \t\n' ' ' )
@@ -148,7 +151,7 @@ do
   ;;
   P*|p*)   vol=$ref
            ns="${vol%/*}"; pvc="${vol#*/}"
-           PVC_USER[$vol]=$(kubectl -n $ns get pvc/$pvc -o jsonpath='{.metadata.annotations.user-mount}')
+           PVC_USER[$vol]=$(kubectl --kubeconfig "$KUBECONFIG" -n $ns get pvc/$pvc -o jsonpath='{.metadata.annotations.user-mount}')
            for user in ${PVC_USER[$vol]}
            do
              start-user-watch $user
