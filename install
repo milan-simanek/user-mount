@@ -10,5 +10,4 @@ systemctl daemon-reload
 systemctl enable user-mount.service
 systemctl start user-mount.service
 
-echo "please create kubeconfig in /opt/user-mount/etc"
-echo "or specify its location in KUBECONFIG variable"
+./create-identity

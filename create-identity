@@ -1,0 +1,64 @@
+#!/bin/bash
+
+[ -z "$NEWCONFIG" ]	&& NEWCONFIG=/opt/user-mount/etc/kubeconfig.yaml	# an identity config to be created
+[ -z "$KUBECONFIG" ]	&& echo "kubeconfig not specified (KUBECONFIG), assuming /etc/kubernetes/admin.conf" && KUBECONFIG=/etc/kubernetes/admin.conf
+[ ! -f "$KUBECONFIG" ]	&& echo "kubeconfig $KUBECONFIG not found, trying KUBECONFIG=~/.kube/config" && KUBECONFIG=~/.kube/config
+[ ! -f "$KUBECONFIG" ]	&& echo "kubeconfig not found, exitting" && exit 1
+
+CAEXPIRE="$(awk '/certificate-authority-data/{print $2}' < ~/.kube/config	\
+           | base64 -d								\
+           | openssl x509 -noout -dates						\
+           | sed -n '/notAfter=/s/.*=//p' )"
+CAEXP=$(date -d "$CAEXPIRE" +%s)
+NOW=$(date +%s)
+let VALIDITY=CAEXP-NOW-600
+
+KEY=$(openssl genpkey -algorithm Ed25519 |base64|tr -d '\n')
+CSR=$(echo "$KEY"|base64 -d|openssl req -new -key /dev/stdin -subj "/CN=user-mount/O=user"|base64|tr -d '\n')
+kubectl get csr user-mount &>/dev/null && kubectl delete csr user-mount
+sleep 1
+kubectl apply -f - <<-EOF
+	apiVersion: certificates.k8s.io/v1
+	kind: CertificateSigningRequest
+	metadata:
+	  name: user-mount
+	spec:
+	  request: $CSR
+	  signerName: kubernetes.io/kube-apiserver-client
+	  expirationSeconds: $VALIDITY
+	  usages:
+	  - client auth
+	EOF
+kubectl certificate approve user-mount
+echo -n "waiting for certificate: "
+n=1;
+while ! kubectl get certificatesigningrequest.certificates.k8s.io/user-mount \
+                -o jsonpath='{.status.conditions[?(@.type=="Approved")].status}' \
+        | grep -qi true
+do
+    echo -n '.'
+    (( n++ > 10 )) && echo "timeout signing user certificate!" && exit 1
+done
+echo "done."
+
+mkdir -p "${NEWCONFIG%/*}"
+cat > "$NEWCONFIG" <<-EOF
+	apiVersion: v1
+	kind: Config
+	contexts:
+	- context:
+	    cluster: kubernetes
+	    user: user-mount
+	  name: ctx
+	current-context: ctx
+	preferences: {}
+	users:
+	- name: user-mount
+	  user:
+	    client-certificate-data: $(kubectl get csr/user-mount -o jsonpath="{.status.certificate}"|tr -d '\n')
+	    client-key-data: $KEY
+	EOF
+sed -n '/^clusters:/,/^[a-z]/p' "$KUBECONFIG" | head -n -1 >> "$NEWCONFIG"
+
+kubectl apply -f crole.yaml || exit 3
+kubectl apply -f crolebinding.yaml || exit 4
