@@ -14,7 +14,7 @@ declare -A USER_WATCH   # [username] -> pid of watch process
 [ ! -x /usr/bin/inotifywait ] && echo "please install package inotify-tools!" >&2 && exit 1
 [ ! -r "$KUBECONFIG" -o ! -f "$KUBECONFIG" ] && "kube config not found or not readable: $KUBECONFIG" >&2 && exit 1
 echo "Waiting for api-server..." >&2
-while ! kubectl --kubeconfig "$KUBECONFIG" get nodes -o name ; do sleep 60 ; done &> /dev/null
+while ! kubectl --kubeconfig "$KUBECONFIG" get pvs -o name ; do sleep 60 ; done &> /dev/null
 echo "OK, api-server reachable." >&2
 
 start-pvc-watch() {
