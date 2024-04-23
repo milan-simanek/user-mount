@@ -16,23 +16,8 @@ echo "OK, api-server reachable." >&2
 
 rm -f "$FIFO"
 
-user-watch() {	# $1=username
-  [ -z "$1" ] && return
-  uhome=$(homedir $1)
-  [ -z "$uhome" -o ! -d "$uhome" ] && return
-  echo U $user > "$FIFO"	# maybe we missed something, so just to be sure
-  inotifywait -mq -e create,close_write,move,delete "$uhome" | while read fname events arg
-  do
-    [ "$arg" = "$ALLOW_FILE" ] && echo U $user > "$FIFO"
-  done
-}
-
 start-pvc-watch() {
-  kubectl get pvc -A -w -o jsonpath='{.metadata.namespace}{"/"}{.metadata.name}{"\n"}' \
-  | while read pvc
-    do
-      echo P "$pvc" > "$FIFO"
-    done &
+  kubectl get pvc -A -w -o jsonpath='{"P "}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}' </dev/null > "$FIFO" &
   PVC_WATCH_PID=$!
   echo "PVC watch started as $PVC_WATCH_PID" >&2
 }
@@ -42,16 +27,20 @@ start-user-watch() {	# $1=username
   echo "Starting user-watch $1" >&2
   [ -n "$1" ] || return
   [ -n "${USER_WATCH[$1]}" -a -d /proc/"${USER_WATCH[$1]}" ] && return # already running
-  user-watch "$1" &
+  unset USER_WATCH[$1]
+  uhome=$(homedir $1)
+  [ -z "$uhome" -o ! -d "$uhome" ] && return
+  inotifywait -mq -e create,close_write,move,delete "$uhome" --format "U $1 %f" </dev/null > "$FIFO" &
   USER_WATCH[$1]=$!
+  echo "U $1" > "$FIFO" &	# forcing initial check (needs & to prevent deadlock)
   echo "User watch [$1] started as ${USER_WATCH[$1]}" >&2
 }
 stop-user-watch() {	# $1=username
   echo "Stopping user-watch $1" >&2
   [ -n "$1" ] || return
   [ -z "${USER_WATCH[$1]}" ] && return		# no watch
-  USER_WATCH[$1]=''
   [ -d /proc/"${USER_WATCH[$1]}" ] && kill "${USER_WATCH[$1]}"
+  unset USER_WATCH[$1]
 }
 
 homedir() {		# $1=user
@@ -108,14 +97,10 @@ check_umount() {		# $1=user_home $2=volume
 }
 
 restarter() {
-  wait -n -p pid 
-  status=$?
-  [ "$status" = 127 ] && return
-  echo "skoncil proces $pid status=$?" >&2
-  [ "$pid" = "$PVC_WATCH_PID" ] && echo "restarting PVC watch" >&2 && start-pvc-watch && return
+  [ ! -d "/proc/$PVC_WATCH_PID" ] && echo "restarting PVC watch" >&2 && start-pvc-watch
   for user in "${!USER_WATCH[@]}"
   do
-    [ "$pid" = "${USER_WATCH[$user]}" ] && start-user-watch "$user"
+    [ ! -d "/proc/${USER_WATCH[$user]}" ] && echo "restarting dead process ${USER_WATCH[$user]} for user $user" && start-user-watch "$user"
   done
 }
 
@@ -138,7 +123,8 @@ do
   do
     case "$objtype" in
     U*|u*) user="$ref"
-           uhome="$(homedir "$ref")"
+           [ -n "$x" -a "$x" != "$ALLOW_FILE" ] && continue
+           uhome="$(homedir "$user")"
            USER_PVC[$user]=''
            # does any volume refer to the user $user ?
            match=0;for uu in ${PVC_USER[*]}; do [ "$uu" = "$user" ] && match=1 && break; done
@@ -149,7 +135,7 @@ do
            fi
            [ -z "$uhome" ] && echo "Error: User '$user' has no home directory?" >&2 && continue	
            [ ! -d "$uhome" ] && echo "Error: User '$user': home directory '$uhome' is not a directory?" >&2 && continue
-           [ -r "$uhome/$ALLOW_FILE" ] \
+           [ -r "$uhome/$ALLOW_FILE" -a -f "$uhome/$ALLOW_FILE" ] \
            && USER_PVC[$user]=$( cut -f1 -d'#' "$uhome/$ALLOW_FILE" \
                                | tr -dc 'a-z./ \t\n-' \
                                | awk '{print $1}' \
