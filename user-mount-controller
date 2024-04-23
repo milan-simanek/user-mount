@@ -8,20 +8,17 @@ declare -A PVC_USER	# [namespace/pvc] -> list of usernames
 declare -A USER_PVC     # [username] -> list of namespace/pvc
 declare -A USER_WATCH   # [username] -> pid of watch process
 
-
+# initial check
 [ ! -x /usr/bin/inotifywait ] && echo "please install package inotify-tools!" >&2 && exit 1
 echo "Waiting for api-server..." >&2
 while ! kubectl get nodes -o name ; do sleep 60 ; done &> /dev/null
 echo "OK, api-server reachable." >&2
-
-rm -f "$FIFO"
 
 start-pvc-watch() {
   kubectl get pvc -A -w -o jsonpath='{"P "}{.metadata.namespace}{"/"}{.metadata.name}{"\n"}' </dev/null > "$FIFO" &
   PVC_WATCH_PID=$!
   echo "PVC watch started as $PVC_WATCH_PID" >&2
 }
-
 
 start-user-watch() {	# $1=username
   echo "Starting user-watch $1" >&2
@@ -35,6 +32,7 @@ start-user-watch() {	# $1=username
   echo "U $1" > "$FIFO" &	# forcing initial check (needs & to prevent deadlock)
   echo "User watch [$1] started as ${USER_WATCH[$1]}" >&2
 }
+
 stop-user-watch() {	# $1=username
   echo "Stopping user-watch $1" >&2
   [ -n "$1" ] || return
@@ -46,21 +44,20 @@ stop-user-watch() {	# $1=username
 homedir() {		# $1=user
   getent passwd "$1" | cut -f6 -d:
 }
+
 home-to-user() {	# $1=home_directory
   getent passwd | awk -F: '$6=="'"$1"'" {print $1}'
 }
 
-mkfifo -m 600 "$FIFO"
-
-does_user_ref_vol() { # $1=user $2=volume
+does_user_ref_vol() {	# $1=user $2=volume
   local vlist=" ${USER_PVC[$1]} "
   [ "${vlist/ $2 }" != "$vlist" ]
 }
-does_vol_ref_user() { # $1=user $2=volume
+does_vol_ref_user() {	# $1=user $2=volume
   local ulist=" ${PVC_USER[$2]} "
   [ "${ulist/ $1 }" != "$ulist" ]
 }
-check_references() {  # $1=user $2=volume
+check_references() {	# $1=user $2=volume
   does_user_ref_vol "$1" "$2" && does_vol_ref_user "$1" "$2"
 }
 
@@ -80,7 +77,7 @@ ensure_mounted() {	# $1=user, $2=vol
   mount -o bind,nodev,nosuid "$pvpath" "$mnt"
 }
 
-check_umount() {		# $1=user_home $2=volume
+check_umount() {	# $1=user_home $2=volume
   local uhome_re="${1:-.*}"
   local vol_re="${2:-.*}"
   local xuhome xvol xuser
@@ -96,7 +93,7 @@ check_umount() {		# $1=user_home $2=volume
   done
 }
 
-restarter() {
+restarter() {		# restarts any missing child process
   [ ! -d "/proc/$PVC_WATCH_PID" ] && echo "restarting PVC watch" >&2 && start-pvc-watch
   for user in "${!USER_WATCH[@]}"
   do
@@ -104,26 +101,29 @@ restarter() {
   done
 }
 
-restart-all() {
+restart-all() {		# restart everything
   trap - CHLD
   kill ${USER_WATCH[*]} $PVC_WATCH_PID
   exec $0
   exit
 }
 
-trap 'kill $PVC_WATCH_PID ${USER_WATCH[*]}' exit
-trap restarter CHLD
-trap restart-all HUP
 
-start-pvc-watch
+rm -f "$FIFO"		# remove old fifo pathname
+mkfifo -m 600 "$FIFO"	# create a new one (to separate possible old processes)
+
+trap 'kill $PVC_WATCH_PID ${USER_WATCH[*]}' exit	# kill child processes on exit
+trap restarter CHLD					# check children on SIGCHILD
+trap restart-all HUP					# restart all if we have to reload config
+
+start-pvc-watch		# we always watch PVCs
 
 while true
 do
-  while read -t 10 objtype ref x
-  do
-    case "$objtype" in
-    U*|u*) user="$ref"
-           [ -n "$x" -a "$x" != "$ALLOW_FILE" ] && continue
+  read -t 10 objtype ref file x || continue
+  case "$objtype" in
+  U*|u*)   user="$ref"
+           [ -n "$file" -a "$file" != "$ALLOW_FILE" ] && continue
            uhome="$(homedir "$user")"
            USER_PVC[$user]=''
            # does any volume refer to the user $user ?
@@ -145,8 +145,8 @@ do
              does_vol_ref_user $user $vol && ensure_mounted $user $vol
            done
            check_umount $uhome ""
-    ;;
-    P*|p*) vol=$ref
+  ;;
+  P*|p*)   vol=$ref
            ns="${vol%/*}"; pvc="${vol#*/}"
            PVC_USER[$vol]=$(kubectl -n $ns get pvc/$pvc -o jsonpath='{.metadata.annotations.user-mount}')
            for user in ${PVC_USER[$vol]}
@@ -155,7 +155,6 @@ do
              does_user_ref_vol $user $vol && ensure_mounted $user $vol
            done
            check_umount "" $vol
-    ;;
-    esac
-  done < "$FIFO"
-done
+  ;;
+  esac
+done < "$FIFO"
