@@ -1,0 +1,14 @@
+#!/bin/bash
+
+umask 022
+mkdir -p /opt/user-mount/{bin,etc}
+cp user-mount-controller /opt/user-mount/bin
+chmod 744 /opt/user-mount/bin/user-mount-controller
+
+cp user-mount.service /etc/systemd/system/user-mount.service
+systemctl daemon-reload
+systemctl enable user-mount.service
+systemctl start user-mount.service
+
+echo "please create kubeconfig in /opt/user-mount/etc"
+echo "or specify its location in KUBECONFIG variable"

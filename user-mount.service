@@ -1,0 +1,15 @@
+# /etc/systemd/system/user-mount.service
+[Unit]
+Description=Automounter for Kubernetes PVC volumes in users' home directories
+After=nss-user-lookup.target systemd-user-sessions.service
+
+[Service]
+EnvironmentFile=-/etc/sysconfig/user-mount
+ExecStart=/opt/user-mount/bin/user-mount-controller
+ExecReload=/bin/kill -HUP $MAINPID
+KillMode=process
+Restart=on-failure
+RestartSec=30s
+
+[Install]
+WantedBy=multi-user.target
