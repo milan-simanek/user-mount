@@ -66,6 +66,7 @@ check_references() {	# $1=user $2=volume
 
 ensure_mounted() {	# $1=user, $2=vol
   local uhome=$(homedir $1)
+  local uid=$(id -u "$1")
   grep -q "^[^ ]* $uhome/$MOUNTPOINT/$2 " /proc/mounts && return	# already mounted
   local ns=${2%/*}
   local pvc=${2#*/}
@@ -77,7 +78,13 @@ ensure_mounted() {	# $1=user, $2=vol
   [ -d "$pvpath" ] || return	# PV is not a directory?!
   su "$1" -c "mkdir -p $mnt" || return
   echo "Mounting PVC $2 into $mnt" >&2
-  mount -o bind,nodev,nosuid "$pvpath" "$mnt"
+#  mount -o bind,nodev,nosuid --map-users 0:$uid:1 "$pvpath" "$mnt"	## --map-users is not supported by kernet at the moment
+  if bindfs --version &>/dev/null
+  then
+    bindfs --map="0/$uid" "$pvpath" "$mnt"
+  else
+    mount -o bind,nodev,nosuid "$pvpath" "$mnt"
+  fi
 }
 
 check_umount() {	# $1=user_home $2=volume
